@@ -1,0 +1,662 @@
+-- AZC14 Freecam -- Standard Roblox LocalScript
+-- Clean client-side camera controller for Roblox Studio / In-Game LocalScripts
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local ContextActionService = game:GetService("ContextActionService")
+local StarterGui = game:GetService("StarterGui")
+
+local player = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+local uiParent = player:WaitForChild("PlayerGui")
+
+-- Freecam Parameters
+local active = false
+local flySpeed = 100
+local minSpeed = 10
+local maxSpeed = 1000
+local speedStep = 10
+local touchSensitivity = 0.35
+local mouseSensitivity = 0.20
+local camYaw = 0
+local camPitch = 0
+local camPos = Vector3.zero
+
+-- Position Memory Storage
+local rememberPosition = false
+local savedPos = nil
+local savedPitch = nil
+local savedYaw = nil
+
+-- Character Anchor Storage
+local frozenCFrame = nil
+local originalAnchored = false
+
+-- Teleport Fall State
+local fallingAfterTeleport = false
+local teleportFallStartTime = 0
+
+-- Player Control Module Cache
+local controls = nil
+pcall(function()
+    local playerScripts = player:WaitForChild("PlayerScripts", 2)
+    if playerScripts then
+        local pm = playerScripts:FindFirstChild("PlayerModule")
+        if pm then
+            controls = require(pm):GetControls()
+        end
+    end
+end)
+
+-- Multi-Touch Tracking for Mobile
+local moveTouchId = nil
+local lookTouchId = nil
+local joystickCenter = Vector2.zero
+local joystickVector = Vector2.zero
+local joystickMaxRadius = 50
+
+-- PC Keyboard Input State
+local keysDown = {
+    W = false,
+    A = false,
+    S = false,
+    D = false,
+    E = false,
+    Q = false,
+    LeftShift = false
+}
+
+local interceptedKeyCodes = {
+    [Enum.KeyCode.W] = "W",
+    [Enum.KeyCode.A] = "A",
+    [Enum.KeyCode.S] = "S",
+    [Enum.KeyCode.D] = "D",
+    [Enum.KeyCode.E] = "E",
+    [Enum.KeyCode.Q] = "Q",
+    [Enum.KeyCode.LeftShift] = "LeftShift",
+    [Enum.KeyCode.RightShift] = "LeftShift"
+}
+
+local renderConnection = nil
+local inputBeganConnection = nil
+local inputChangedConnection = nil
+local inputEndedConnection = nil
+
+-- Animation Registry
+local activeTweens = {}
+local function runSafeTween(id, target, tweenInfo, properties)
+    if activeTweens[id] then
+        activeTweens[id]:Cancel()
+        activeTweens[id] = nil
+    end
+    local tween = TweenService:Create(target, tweenInfo, properties)
+    activeTweens[id] = tween
+    tween.Completed:Connect(function()
+        if activeTweens[id] == tween then
+            activeTweens[id] = nil
+        end
+    end)
+    tween:Play()
+    return tween
+end
+
+-- Cleanup Existing GUI
+if uiParent:FindFirstChild("AZC14Freecam") then
+    uiParent.AZC14Freecam:Destroy()
+end
+
+-- UI Construction
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "AZC14Freecam"
+screenGui.ResetOnSpawn = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.Parent = uiParent
+
+-- Faded Red Glass UI Constructor
+local function applyGlassStyle(guiObject, bgColor, strokeColor, pillRadius, bgTransparency)
+    local trans = bgTransparency or 0
+    guiObject.BackgroundColor3 = bgColor or Color3.fromRGB(35, 10, 15)
+    guiObject.BackgroundTransparency = trans
+    guiObject.BorderSizePixel = 0
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = pillRadius or UDim.new(1, 0)
+    corner.Parent = guiObject
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Thickness = 1.4
+    stroke.Color = strokeColor or Color3.fromRGB(220, 20, 60)
+    stroke.Transparency = math.clamp(trans * 0.4, 0, 0.4)
+    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    stroke.Parent = guiObject
+
+    local grad = Instance.new("UIGradient")
+    grad.Rotation = 45
+    grad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0.0, Color3.fromRGB(200, 25, 45)),
+        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(120, 15, 30)),
+        ColorSequenceKeypoint.new(1.0, Color3.fromRGB(50, 8, 15))
+    })
+    grad.Transparency = NumberSequence.new(trans)
+    grad.Parent = guiObject
+
+    return stroke
+end
+
+-- Button Bounce Feedback
+local function bindButtonBounce(btn, baseScale)
+    baseScale = baseScale or 1
+    local scale = Instance.new("UIScale")
+    scale.Scale = baseScale
+    scale.Parent = btn
+
+    btn.MouseButton1Down:Connect(function()
+        runSafeTween(btn, scale, TweenInfo.new(0.08, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Scale = baseScale * 0.92 })
+    end)
+    btn.MouseButton1Up:Connect(function()
+        runSafeTween(btn, scale, TweenInfo.new(0.12, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = baseScale })
+    end)
+end
+
+-- Mobile Joystick Frame
+local joystickFrame = Instance.new("Frame")
+joystickFrame.Name = "DynamicJoystick"
+joystickFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+joystickFrame.Size = UDim2.new(0, 110, 0, 110)
+joystickFrame.Position = UDim2.new(0, 0, 0, 0)
+joystickFrame.Visible = false
+joystickFrame.Parent = screenGui
+applyGlassStyle(joystickFrame, Color3.fromRGB(45, 10, 18), Color3.fromRGB(255, 40, 70), UDim.new(1, 0), 0.5)
+
+local joystickKnob = Instance.new("Frame")
+joystickKnob.Name = "Knob"
+joystickKnob.AnchorPoint = Vector2.new(0.5, 0.5)
+joystickKnob.Size = UDim2.new(0, 46, 0, 46)
+joystickKnob.Position = UDim2.new(0.5, 0, 0.5, 0)
+joystickKnob.Parent = joystickFrame
+applyGlassStyle(joystickKnob, Color3.fromRGB(85, 18, 30), Color3.fromRGB(255, 80, 100), UDim.new(1, 0), 0.5)
+
+-- Toggle Button
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Name = "ToggleBtn"
+toggleBtn.Size = UDim2.new(0, 110, 0, 40)
+toggleBtn.Position = UDim2.new(1, -125, 0.22, 0)
+toggleBtn.Text = "CAM: OFF"
+toggleBtn.Font = Enum.Font.GothamBold
+toggleBtn.TextSize = 13
+toggleBtn.TextColor3 = Color3.fromRGB(240, 210, 215)
+toggleBtn.Active = true
+toggleBtn.Draggable = true
+toggleBtn.AutoButtonColor = false
+toggleBtn.Parent = screenGui
+local toggleStroke = applyGlassStyle(toggleBtn, Color3.fromRGB(30, 10, 15), Color3.fromRGB(180, 30, 50), UDim.new(1, 0), 0.28)
+bindButtonBounce(toggleBtn)
+
+-- HUD Interface Frame
+local hudFrame = Instance.new("Frame")
+hudFrame.Name = "GlassHUD"
+hudFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+hudFrame.Size = UDim2.new(0, 175, 0, 170)
+hudFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
+hudFrame.Visible = false
+hudFrame.Active = true
+hudFrame.Draggable = true
+hudFrame.ClipsDescendants = false
+hudFrame.Parent = screenGui
+local hudStroke = applyGlassStyle(hudFrame, Color3.fromRGB(35, 8, 14), Color3.fromRGB(220, 20, 60), UDim.new(0, 20), 0.35)
+
+local hudCanvasGroup = Instance.new("CanvasGroup")
+hudCanvasGroup.Name = "Canvas"
+hudCanvasGroup.Size = UDim2.new(1, 0, 1, 0)
+hudCanvasGroup.BackgroundTransparency = 1
+hudCanvasGroup.GroupTransparency = 0
+hudCanvasGroup.Parent = hudFrame
+
+local hudScale = Instance.new("UIScale")
+hudScale.Scale = 1
+hudScale.Parent = hudFrame
+
+-- Title & Credits
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Name = "Title"
+titleLabel.Size = UDim2.new(1, 0, 0, 16)
+titleLabel.Position = UDim2.new(0, 0, 0.05, 0)
+titleLabel.BackgroundTransparency = 1
+titleLabel.Text = "AZC14 FREECAM"
+titleLabel.Font = Enum.Font.GothamBold
+titleLabel.TextSize = 13
+titleLabel.TextColor3 = Color3.fromRGB(255, 70, 90)
+titleLabel.Parent = hudCanvasGroup
+
+local creditsLabel = Instance.new("TextLabel")
+creditsLabel.Name = "Credits"
+creditsLabel.Size = UDim2.new(1, 0, 0, 12)
+creditsLabel.Position = UDim2.new(0, 0, 0.15, 0)
+creditsLabel.BackgroundTransparency = 1
+creditsLabel.Text = "By Johan & Lance"
+creditsLabel.Font = Enum.Font.GothamMedium
+creditsLabel.TextSize = 10
+creditsLabel.TextColor3 = Color3.fromRGB(220, 140, 150)
+creditsLabel.Parent = hudCanvasGroup
+
+-- Speed Controller
+local speedBar = Instance.new("Frame")
+speedBar.Name = "SpeedBar"
+speedBar.Size = UDim2.new(0.9, 0, 0, 32)
+speedBar.Position = UDim2.new(0.05, 0, 0.28, 0)
+speedBar.BackgroundTransparency = 1
+speedBar.Parent = hudCanvasGroup
+
+local speedMinus = Instance.new("TextButton")
+speedMinus.Name = "Minus"
+speedMinus.Size = UDim2.new(0, 32, 0, 32)
+speedMinus.Position = UDim2.new(0, 0, 0, 0)
+speedMinus.Text = "-"
+speedMinus.Font = Enum.Font.GothamBold
+speedMinus.TextSize = 16
+speedMinus.TextColor3 = Color3.fromRGB(255, 255, 255)
+speedMinus.AutoButtonColor = false
+speedMinus.Parent = speedBar
+applyGlassStyle(speedMinus, Color3.fromRGB(55, 15, 22), Color3.fromRGB(200, 30, 55), UDim.new(1, 0), 0.2)
+bindButtonBounce(speedMinus)
+
+local speedLabel = Instance.new("TextLabel")
+speedLabel.Name = "Label"
+speedLabel.Size = UDim2.new(1, -74, 1, 0)
+speedLabel.Position = UDim2.new(0, 37, 0, 0)
+speedLabel.BackgroundTransparency = 1
+speedLabel.Text = "SPD: " .. tostring(flySpeed)
+speedLabel.Font = Enum.Font.GothamBold
+speedLabel.TextSize = 13
+speedLabel.TextColor3 = Color3.fromRGB(255, 220, 225)
+speedLabel.Parent = speedBar
+
+local speedPlus = Instance.new("TextButton")
+speedPlus.Name = "Plus"
+speedPlus.Size = UDim2.new(0, 32, 0, 32)
+speedPlus.Position = UDim2.new(1, -32, 0, 0)
+speedPlus.Text = "+"
+speedPlus.Font = Enum.Font.GothamBold
+speedPlus.TextSize = 16
+speedPlus.TextColor3 = Color3.fromRGB(255, 255, 255)
+speedPlus.AutoButtonColor = false
+speedPlus.Parent = speedBar
+applyGlassStyle(speedPlus, Color3.fromRGB(55, 15, 22), Color3.fromRGB(200, 30, 55), UDim.new(1, 0), 0.2)
+bindButtonBounce(speedPlus)
+
+local function bindHoldStep(button, delta)
+    local isHolding = false
+    local function applyStep()
+        flySpeed = math.clamp(flySpeed + delta, minSpeed, maxSpeed)
+        speedLabel.Text = "SPD: " .. tostring(flySpeed)
+    end
+    button.MouseButton1Down:Connect(function()
+        isHolding = true
+        applyStep()
+        task.delay(0.3, function()
+            while isHolding do
+                applyStep()
+                task.wait(0.06)
+            end
+        end)
+    end)
+    local function release()
+        isHolding = false
+    end
+    button.MouseButton1Up:Connect(release)
+    button.MouseLeave:Connect(release)
+end
+
+bindHoldStep(speedMinus, -speedStep)
+bindHoldStep(speedPlus, speedStep)
+
+-- Memory & Teleport Buttons
+local memBtn = Instance.new("TextButton")
+memBtn.Name = "MemoryBtn"
+memBtn.Size = UDim2.new(0.9, 0, 0, 28)
+memBtn.Position = UDim2.new(0.05, 0, 0.52, 0)
+memBtn.Text = "REMEMBER POS: OFF"
+memBtn.Font = Enum.Font.GothamBold
+memBtn.TextSize = 10
+memBtn.TextColor3 = Color3.fromRGB(220, 190, 195)
+memBtn.AutoButtonColor = false
+memBtn.Parent = hudCanvasGroup
+local memStroke = applyGlassStyle(memBtn, Color3.fromRGB(45, 12, 18), Color3.fromRGB(180, 30, 50), UDim.new(1, 0), 0.2)
+bindButtonBounce(memBtn)
+
+local tpBtn = Instance.new("TextButton")
+tpBtn.Name = "TeleportBtn"
+tpBtn.Size = UDim2.new(0.9, 0, 0, 28)
+tpBtn.Position = UDim2.new(0.05, 0, 0.74, 0)
+tpBtn.Text = "TELEPORT TO CAM"
+tpBtn.Font = Enum.Font.GothamBold
+tpBtn.TextSize = 10
+tpBtn.TextColor3 = Color3.fromRGB(255, 70, 90)
+tpBtn.AutoButtonColor = false
+tpBtn.Parent = hudCanvasGroup
+local tpStroke = applyGlassStyle(tpBtn, Color3.fromRGB(60, 12, 20), Color3.fromRGB(255, 50, 75), UDim.new(1, 0), 0.2)
+bindButtonBounce(tpBtn)
+
+local function animateHud(open)
+    if open then
+        hudFrame.Visible = true
+        hudCanvasGroup.GroupTransparency = 1
+        hudScale.Scale = 0.8
+        runSafeTween("hud_fade", hudCanvasGroup, TweenInfo.new(0.18, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), { GroupTransparency = 0 })
+        runSafeTween("hud_pop", hudScale, TweenInfo.new(0.24, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 })
+    else
+        local fadeTween = runSafeTween("hud_fade", hudCanvasGroup, TweenInfo.new(0.14, Enum.EasingStyle.Quart, Enum.EasingDirection.In), { GroupTransparency = 1 })
+        runSafeTween("hud_pop", hudScale, TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Scale = 0.85 })
+        fadeTween.Completed:Connect(function()
+            if not active then
+                hudFrame.Visible = false
+            end
+        end)
+    end
+end
+
+memBtn.MouseButton1Click:Connect(function()
+    rememberPosition = not rememberPosition
+    if rememberPosition then
+        memBtn.Text = "REMEMBER POS: ON"
+        runSafeTween("mem_col", memBtn, TweenInfo.new(0.12, Enum.EasingStyle.Quad), { TextColor3 = Color3.fromRGB(255, 60, 90) })
+        runSafeTween("mem_strk", memStroke, TweenInfo.new(0.12, Enum.EasingStyle.Quad), { Color = Color3.fromRGB(255, 60, 90) })
+    else
+        memBtn.Text = "REMEMBER POS: OFF"
+        runSafeTween("mem_col", memBtn, TweenInfo.new(0.12, Enum.EasingStyle.Quad), { TextColor3 = Color3.fromRGB(220, 190, 195) })
+        runSafeTween("mem_strk", memStroke, TweenInfo.new(0.12, Enum.EasingStyle.Quad), { Color = Color3.fromRGB(180, 30, 50) })
+        savedPos = nil
+        savedPitch = nil
+        savedYaw = nil
+    end
+end)
+
+-- Teleport Action
+tpBtn.MouseButton1Click:Connect(function()
+    local char = player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    
+    if root and hum then
+        local targetCFrame = CFrame.new(camera.CFrame.Position) * CFrame.Angles(0, math.rad(camYaw), 0)
+        fallingAfterTeleport = true
+        teleportFallStartTime = tick()
+        
+        root.Anchored = false
+        root.CFrame = targetCFrame
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Freefall) end)
+    end
+end)
+
+-- Key Handling via ContextActionService
+local function handleKeyAction(actionName, inputState, inputObject)
+    if not active then return Enum.ContextActionResult.Pass end
+    if inputObject and inputObject.KeyCode then
+        local keyName = interceptedKeyCodes[inputObject.KeyCode]
+        if keyName then
+            local isDown = (inputState == Enum.UserInputState.Begin)
+            keysDown[keyName] = isDown
+        end
+    end
+    return Enum.ContextActionResult.Sink
+end
+
+-- Input Listeners
+inputBeganConnection = UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if input.KeyCode == Enum.KeyCode.P and UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
+        toggleBtn:Activate()
+        return
+    end
+
+    if not active then return end
+
+    if input.UserInputType == Enum.UserInputType.Touch and not gameProcessed then
+        local vpSize = camera.ViewportSize
+        local touchPos = Vector2.new(input.Position.X, input.Position.Y)
+        
+        if touchPos.X < (vpSize.X * 0.48) and not moveTouchId then
+            moveTouchId = input
+            joystickCenter = touchPos
+            joystickFrame.Position = UDim2.new(0, touchPos.X, 0, touchPos.Y)
+            joystickKnob.Position = UDim2.new(0.5, 0, 0.5, 0)
+            joystickVector = Vector2.zero
+            joystickFrame.Visible = true
+        elseif touchPos.X >= (vpSize.X * 0.48) and not lookTouchId then
+            lookTouchId = input
+        end
+    end
+end)
+
+inputChangedConnection = UserInputService.InputChanged:Connect(function(input, gameProcessed)
+    if not active then return end
+
+    if input.UserInputType == Enum.UserInputType.Touch then
+        if input == moveTouchId then
+            local currentPos = Vector2.new(input.Position.X, input.Position.Y)
+            local delta = currentPos - joystickCenter
+            local dist = delta.Magnitude
+            if dist > joystickMaxRadius then
+                delta = delta.Unit * joystickMaxRadius
+            end
+            joystickKnob.Position = UDim2.new(0.5, delta.X, 0.5, delta.Y)
+            joystickVector = Vector2.new(delta.X / joystickMaxRadius, -delta.Y / joystickMaxRadius)
+        elseif input == lookTouchId then
+            local d = input.Delta
+            camYaw = camYaw - (d.X * touchSensitivity)
+            camPitch = math.clamp(camPitch - (d.Y * touchSensitivity), -89, 89)
+        end
+    end
+
+    if input.UserInputType == Enum.UserInputType.MouseMovement then
+        if UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+            local d = input.Delta
+            camYaw = camYaw - (d.X * mouseSensitivity)
+            camPitch = math.clamp(camPitch - (d.Y * mouseSensitivity), -89, 89)
+        end
+    end
+end)
+
+inputEndedConnection = UserInputService.InputEnded:Connect(function(input)
+    if input == moveTouchId then
+        moveTouchId = nil
+        joystickVector = Vector2.zero
+        joystickFrame.Visible = false
+    elseif input == lookTouchId then
+        lookTouchId = nil
+    end
+end)
+
+-- Freecam Lifecycle Functions
+local function startFreecam()
+    local char = player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    
+    if not char or not hum or not root then return end
+
+    hum:UnequipTools()
+    pcall(function() StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, false) end)
+
+    fallingAfterTeleport = false
+    originalAnchored = root.Anchored
+    frozenCFrame = root.CFrame
+    root.Anchored = true
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+
+    if controls then
+        controls:Disable()
+    end
+    
+    local touchGui = player:FindFirstChild("PlayerGui") and player.PlayerGui:FindFirstChild("TouchGui")
+    if touchGui then
+        touchGui.Enabled = false
+    end
+
+    ContextActionService:BindActionAtPriority(
+        "FreecamKeySink",
+        handleKeyAction,
+        false,
+        Enum.ContextActionPriority.High.Value,
+        Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D,
+        Enum.KeyCode.E, Enum.KeyCode.Q, Enum.KeyCode.Space,
+        Enum.KeyCode.LeftShift, Enum.KeyCode.RightShift,
+        Enum.PlayerActions.CharacterForward, Enum.PlayerActions.CharacterBackward,
+        Enum.PlayerActions.CharacterLeft, Enum.PlayerActions.CharacterRight,
+        Enum.PlayerActions.CharacterJump
+    )
+
+    if rememberPosition and savedPos and savedPitch and savedYaw then
+        camPos = savedPos
+        camPitch = savedPitch
+        camYaw = savedYaw
+    else
+        local currentCF = camera.CFrame
+        camPos = currentCF.Position
+        local x, y, _ = currentCF:ToOrientation()
+        camPitch = math.deg(x)
+        camYaw = math.deg(y)
+    end
+
+    camera.CameraType = Enum.CameraType.Scriptable
+
+    renderConnection = RunService.RenderStepped:Connect(function(dt)
+        if char and root then
+            if fallingAfterTeleport then
+                local elapsed = tick() - teleportFallStartTime
+                local vel = root.AssemblyLinearVelocity
+                local groundParams = RaycastParams.new()
+                groundParams.FilterType = Enum.RaycastFilterType.Exclude
+                groundParams.FilterDescendantsInstances = { char }
+                groundParams.IgnoreWater = true
+                
+                local castDist = (root.Size.Y / 2) + 0.35
+                local groundHit = workspace:Raycast(root.Position, Vector3.new(0, -castDist, 0), groundParams)
+                local touchingGround = groundHit ~= nil
+                local settledVelocity = math.abs(vel.Y) < 1.5
+                local timedOut = elapsed > 8
+
+                if elapsed > 0.15 and ((touchingGround and settledVelocity) or timedOut) then
+                    fallingAfterTeleport = false
+                    root.Anchored = true
+                    root.AssemblyLinearVelocity = Vector3.zero
+                    root.AssemblyAngularVelocity = Vector3.zero
+                    frozenCFrame = root.CFrame
+                end
+            else
+                root.CFrame = frozenCFrame
+                root.Anchored = true
+                root.AssemblyLinearVelocity = Vector3.zero
+                root.AssemblyAngularVelocity = Vector3.zero
+            end
+        end
+
+        local rotCFrame = CFrame.Angles(0, math.rad(camYaw), 0) * CFrame.Angles(math.rad(camPitch), 0, 0)
+        local moveVector = Vector3.zero
+
+        if joystickVector.Magnitude > 0.05 then
+            local right = rotCFrame.RightVector * joystickVector.X
+            local forward = rotCFrame.LookVector * joystickVector.Y
+            moveVector = moveVector + right + forward
+        end
+
+        local kbForward = 0
+        local kbRight = 0
+        local kbUp = 0
+
+        if keysDown.W then kbForward = kbForward + 1 end
+        if keysDown.S then kbForward = kbForward - 1 end
+        if keysDown.D then kbRight = kbRight + 1 end
+        if keysDown.A then kbRight = kbRight - 1 end
+        if keysDown.E then kbUp = kbUp + 1 end
+        if keysDown.Q then kbUp = kbUp - 1 end
+
+        if kbForward ~= 0 or kbRight ~= 0 or kbUp ~= 0 then
+            local pcMove = (rotCFrame.LookVector * kbForward) + (rotCFrame.RightVector * kbRight) + (Vector3.new(0, 1, 0) * kbUp)
+            moveVector = moveVector + pcMove
+        end
+
+        if moveVector.Magnitude > 0 then
+            local currentMultiplier = keysDown.LeftShift and 2.0 or 1.0
+            camPos = camPos + (moveVector.Unit * (flySpeed * currentMultiplier * dt))
+        end
+
+        camera.CFrame = CFrame.new(camPos) * rotCFrame
+    end)
+end
+
+local function stopFreecam()
+    if renderConnection then
+        renderConnection:Disconnect()
+        renderConnection = nil
+    end
+
+    ContextActionService:UnbindAction("FreecamKeySink")
+
+    pcall(function() StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, true) end)
+
+    moveTouchId = nil
+    lookTouchId = nil
+    joystickVector = Vector2.zero
+    joystickFrame.Visible = false
+
+    if controls then
+        controls:Enable()
+    end
+    
+    local touchGui = player:FindFirstChild("PlayerGui") and player.PlayerGui:FindFirstChild("TouchGui")
+    if touchGui then
+        touchGui.Enabled = true
+    end
+
+    for k in pairs(keysDown) do
+        keysDown[k] = false
+    end
+
+    if rememberPosition then
+        savedPos = camPos
+        savedPitch = camPitch
+        savedYaw = savedYaw
+    end
+
+    local char = player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+
+    if hum then
+        camera.CameraSubject = hum
+    end
+
+    if root then
+        root.Anchored = originalAnchored
+        if not fallingAfterTeleport then
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end
+    end
+
+    fallingAfterTeleport = false
+    camera.CameraType = Enum.CameraType.Custom
+end
+
+-- Toggle Button Listener
+toggleBtn.MouseButton1Click:Connect(function()
+    active = not active
+    if active then
+        toggleBtn.Text = "CAM: ON"
+        runSafeTween("btn_col", toggleBtn, TweenInfo.new(0.12, Enum.EasingStyle.Quad), { TextColor3 = Color3.fromRGB(255, 60, 90) })
+        runSafeTween("btn_strk", toggleStroke, TweenInfo.new(0.12, Enum.EasingStyle.Quad), { Color = Color3.fromRGB(255, 60, 90) })
+        animateHud(true)
+        startFreecam()
+    else
+        toggleBtn.Text = "CAM: OFF"
+        runSafeTween("btn_col", toggleBtn, TweenInfo.new(0.12, Enum.EasingStyle.Quad), { TextColor3 = Color3.fromRGB(240, 210, 215) })
+        runSafeTween("btn_strk", toggleStroke, TweenInfo.new(0.12, Enum.EasingStyle.Quad), { Color = Color3.fromRGB(180, 30, 50) })
+        animateHud(false)
+        stopFreecam()
+    end
+end)
